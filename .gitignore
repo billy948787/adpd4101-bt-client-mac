@@ -2,3 +2,12 @@
 .zig-cache/
 .DS_Store
 zig-out/
+
+# Fuck python
+*.py
+
+*lock
+.venv/
+
+pyproject.toml
+.python-version

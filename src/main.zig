@@ -34,9 +34,13 @@ export fn on_data_received(data: [*c]const u8, len: usize) void {
         return;
     };
 
-    stdout.print("Received data len: {d}\n", .{slice.len}) catch |err| {
-        std.debug.print("Failed to write to stdout: {any}\n", .{err});
-    };
+    // stdout.print("Received data len: {d}\n", .{slice.len}) catch |err| {
+    //     std.debug.print("Failed to write to stdout: {any}\n", .{err});
+    // };
+
+    // stdout.writeAll(slice) catch |err| {
+    //     std.debug.print("Failed to write to stdout: {any}\n", .{err});
+    // };
 }
 
 pub fn main() !void {
@@ -58,6 +62,13 @@ pub fn main() !void {
     });
 
     defer data_file.close();
+
+    // check if the file is empty, and if so, write the header
+    const file_info = try data_file.stat();
+    if (file_info.size == 0) {
+        const header = "serial num, data, timestamp\n";
+        try data_file.writeAll(header);
+    }
 
     // Move to the end of the file to append new data
     try data_file.seekFromEnd(0);
