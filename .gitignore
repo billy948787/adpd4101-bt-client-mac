@@ -11,3 +11,4 @@ zig-out/
 
 pyproject.toml
 .python-version
+*.mp4

@@ -13,7 +13,7 @@ var should_exit = std.atomic.Value(bool).init(false);
 
 var data_file: std.fs.File = undefined;
 
-const bluetooth_addr = "DC:EC:4F:5D:75:D8";
+const bluetooth_addr = "DC:EC:4F:5D:93:08";
 
 fn handle_signal(signum: c_int) callconv(.c) void {
     _ = signum;
@@ -66,7 +66,7 @@ pub fn main() !void {
     // check if the file is empty, and if so, write the header
     const file_info = try data_file.stat();
     if (file_info.size == 0) {
-        const header = "serial num, data, timestamp\n";
+        const header = "serial_num,sensor_type,sensor_timestamp,host_monotonic_timestamp,ppg_value,ax,ay,az,gx,gy,gz\n";
         try data_file.writeAll(header);
     }
 
