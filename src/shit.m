@@ -3,40 +3,48 @@
 #import "bt_bridge.h"
 
 static DataCallback globalCallback = NULL;
+static volatile bool isRunning = true;
 
-// 定義 Delegate 類別來處理 RFCOMM 事件
 @interface BTDelegate : NSObject <IOBluetoothRFCOMMChannelDelegate>
+@property (assign) BOOL isActive;
 @end
 
 @implementation BTDelegate
 
 - (void)rfcommChannelOpenComplete:(IOBluetoothRFCOMMChannel *)channel status:(IOReturn)status opID:(int)opID {
+    if (!self.isActive) return;
     if (status == kIOReturnSuccess) {
         printf(">>> [Mac] RFCOMM Channel 連線成功!\n");
     } else {
         printf(">>> [Mac] RFCOMM 連線失敗，錯誤碼: 0x%x\n", status);
-        exit(1);
+        isRunning = false;
     }
 }
 
 - (void)rfcommChannelData:(IOBluetoothRFCOMMChannel *)channel data:(void *)dataPointer length:(size_t)dataLength {
-    // 收到數據，轉傳給 Zig
+    if (!self.isActive) return;
     if (globalCallback) {
         globalCallback((const uint8_t*)dataPointer, dataLength);
     }
 }
 
 - (void)rfcommChannelClosed:(IOBluetoothRFCOMMChannel *)channel {
+    if (!self.isActive) return;
     printf(">>> [Mac] RFCOMM Channel 已關閉\n");
-    exit(0);
+    isRunning = false;
 }
 
 @end
 
-static volatile bool isRunning = true;
-
 void stop_bluetooth_loop() {
     isRunning = false;
+}
+
+static void interruptible_sleep(double seconds) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:seconds];
+    while (isRunning && [deadline timeIntervalSinceNow] > 0) {
+        [NSThread sleepForTimeInterval:0.1];
+    }
 }
 
 void start_bluetooth_connection(const char* mac_addr, int channel_id, DataCallback callback) {
@@ -51,74 +59,76 @@ void start_bluetooth_connection(const char* mac_addr, int channel_id, DataCallba
             printf("錯誤: 找不到裝置 %s\n", mac_addr);
             return;
         }
-        
-        // 檢查是否已建立底層連線
-        if (![device isConnected]) {
-            printf(">>> [Mac] 底層未連線，強制執行 openConnection()...\n");
-            
-            // 1. 強制建立 Baseband 連線
-            IOReturn ret = [device openConnection];
-            
-            if (ret != kIOReturnSuccess) {
-                printf("錯誤: 底層連線失敗 (0x%x)\n", ret);
-                // 這裡可以選擇是否要 return，或是硬著頭皮試試看
-                return; 
-            }
-            
-            printf(">>> [Mac] 底層連線建立，等待 1 秒讓訊號穩定...\n");
-            
-            // 2. 暫停 1 秒 (相當於 Python 的 time.sleep(1))
-            [NSThread sleepForTimeInterval:1.0];
-            
-        } else {
-            printf(">>> [Mac] 底層已連線 斷線重開...\n");
-            // 如果已連線，先關閉再重新開啟
-            [device closeConnection];
-            [NSThread sleepForTimeInterval:1.0];
-            IOReturn ret = [device openConnection];
-            if (ret != kIOReturnSuccess) {
-                printf("錯誤: 底層重新連線失敗 (0x%x)\n", ret);
-                return;
-            }
-        }
-
-        printf(">>> [Mac] 正在開啟 RFCOMM Channel %d...\n", channel_id);
-
-        BTDelegate *delegate = [[BTDelegate alloc] init];
-        IOBluetoothRFCOMMChannel *channel;
-        
-        // 發起 RFCOMM 連線
-        [device openRFCOMMChannelAsync:&channel withChannelID:channel_id delegate:delegate];
-
-        // 啟動 RunLoop (這會卡住這裡，直到程式結束)
-        printf(">>> [Mac] 進入事件迴圈...\n");
-        while (isRunning && [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]]) {
-            // 這個迴圈每 0.1 秒會檢查一次 shouldKeepRunning
-            // 或者當有藍牙事件發生時也會醒來
-        }
 
         if ([device isConnected]) {
-            // 關閉 RFCOMM (嚴格來說 closeConnection 會一併處理，但這樣比較保險)
-            if (channel && [channel isOpen]) {
-                [channel closeChannel];
-            }
-            
-            // 斷開底層 Baseband 連線
+            printf(">>> [Mac] 偵測到舊連線殘留，先強制關閉...\n");
             [device closeConnection];
-            
-            // 重要：給予藍牙 stack 一點時間送出斷線訊號
-            [NSThread sleepForTimeInterval:0.5];
+            interruptible_sleep(2.0);
+            if (!isRunning) return;
         }
+
+        // 建立底層連線，最多 retry 5 次
+        IOReturn ret = kIOReturnError;
+        for (int attempt = 1; attempt <= 5 && isRunning; attempt++) {
+            printf(">>> [Mac] 建立底層連線... (第 %d 次)\n", attempt);
+            ret = [device openConnection];
+            if (ret == kIOReturnSuccess) {
+                printf(">>> [Mac] 底層連線建立，等待 1 秒讓訊號穩定...\n");
+                interruptible_sleep(1.0);
+                break;
+            }
+            printf(">>> [Mac] 底層連線失敗 (0x%x)，等待 2 秒後重試...\n", ret);
+            interruptible_sleep(2.0);
+        }
+
+        if (!isRunning) { printf(">>> [Mac] 收到中斷信號\n"); return; }
+        if (ret != kIOReturnSuccess) { printf("錯誤: 底層連線重試 5 次仍失敗\n"); return; }
+
+        // 開啟 RFCOMM Channel，直接跑 RunLoop，不等 openComplete
+        printf(">>> [Mac] 正在開啟 RFCOMM Channel %d...\n", channel_id);
+        BTDelegate *delegate = [[BTDelegate alloc] init];
+        delegate.isActive = YES;
+        IOBluetoothRFCOMMChannel *channel = nil;
+        ret = [device openRFCOMMChannelAsync:&channel withChannelID:channel_id delegate:delegate];
+
+        if (ret != kIOReturnSuccess || channel == nil) {
+            printf("錯誤: 無法發起 RFCOMM 連線 (0x%x)\n", ret);
+            [device closeConnection];
+            return;
+        }
+
+        // 直接進 RunLoop，callback 自己會來
+        printf(">>> [Mac] 進入事件迴圈...\n");
+        while (isRunning) {
+            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                    beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+        }
+
+        // 優雅清理
+        delegate.isActive = NO;
+        printf(">>> [Mac] 正在關閉連線...\n");
+        if (channel && [channel isOpen]) {
+            [channel closeChannel];
+            NSDate *closeDeadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+            while ([closeDeadline timeIntervalSinceNow] > 0) {
+                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+            }
+        }
+        if ([device isConnected]) {
+            [device closeConnection];
+        }
+        [NSThread sleepForTimeInterval:1.5];
+        printf(">>> [Mac] 連線已完整關閉\n");
     }
 }
 
 void cleanup_bluetooth_connection(const char* mac_addr) {
-    @autoreleasepool{
+    @autoreleasepool {
         NSString *addrStr = [NSString stringWithUTF8String:mac_addr];
         IOBluetoothDevice *device = [IOBluetoothDevice deviceWithAddressString:addrStr];
-
-        if([device isConnected]){
-            printf(">>> [Mac] 清理連線: 關閉 RFCOMM Channel 和底層連線...\n");
+        if ([device isConnected]) {
+            printf(">>> [Mac] 清理連線: 關閉底層連線...\n");
             [device closeConnection];
         }
     }

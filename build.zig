@@ -75,17 +75,27 @@ pub fn build(b: *std.Build) !void {
     });
 
     exe.linkLibC();
-    exe.linkFramework("Foundation");
-    exe.linkFramework("AppKit");
-    exe.linkFramework("IOBluetooth");
     exe.addIncludePath(b.path("src/"));
 
-    exe.addCSourceFile(.{
-        .file = b.path("src/shit.m"),
-        .flags = &.{
-            "-fobjc-arc",
+    switch (target.result.os.tag) {
+        .macos => {
+            exe.linkFramework("Foundation");
+            exe.linkFramework("AppKit");
+            exe.linkFramework("IOBluetooth");
+            exe.addCSourceFile(.{
+                .file = b.path("src/shit.m"),
+                .flags = &.{"-fobjc-arc"},
+            });
         },
-    });
+        .windows => {
+            exe.linkSystemLibrary("ws2_32");
+            exe.addCSourceFile(.{
+                .file = b.path("src/bt_bridge_win.c"),
+                .flags = &.{},
+            });
+        },
+        else => @panic("不支援的作業系統"),
+    }
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
